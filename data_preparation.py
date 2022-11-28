@@ -543,6 +543,18 @@ tallo_sites = tallo_sites[["tree_id","site_id","n_samples"]]
 tallo_full = tallo_full.drop(["site_id","n_samples"],axis="columns")
 tallo = tallo_full.merge(tallo_sites, on="tree_id")
 
+# Replace no_data values by np.nan
+no_data = -9999.9999
+tallo = tallo.replace(-9999.9999, np.nan)
+
+print(tallo[tallo.stem_diame.isna()].shape[0])
+print(tallo[tallo.crown_radi.isna()].shape[0])
+print(tallo[tallo.height_m.isna()].shape[0])
+
+print( tallo[ (tallo.crown_radi.isna()) & (tallo.stem_diame.isna()) ].shape[0])
+print( tallo[ (tallo.height_m.isna()) & (tallo.stem_diame.isna()) ].shape[0])
+print( tallo[ (tallo.height_m.isna()) & (tallo.crown_radi.isna()) ].shape[0])
+
 """
 Fill crown-radius data with height and diameter allometry based from:
 Jucker et al. 2016, Allometric equations for integrating remote sensing imagery
@@ -552,12 +564,193 @@ into forest monitoring programmes. Global Change Biology.
 def crown_radius(height, diameter):
     return np.exp(-0.5/0.809*0.056**2) / np.power(0.557,1/0.809) * np.power(diameter,1/0.809) / height
 
+def height(crown_radius, diameter):
+    return np.exp(-0.5/0.809*0.056**2) / np.power(0.557,1/0.809) * np.power(diameter,1/0.809) / crown_radius
+
 tallo["crown_radi"] = np.where(
-    tallo['crown_radi'].isna(), crown_radius(tallo["height_m"],tallo["stem_diame"]), tallo['crown_radi']
+    tallo['crown_radi'].isna(),
+    crown_radius(tallo["height_m"],tallo["stem_diame"]),
+    tallo['crown_radi']
+)
+tallo["height_m"] = np.where(
+    tallo['height_m'].isna(),
+    crown_radius(tallo["crown_radi"],tallo["stem_diame"]),
+    tallo['height_m']
 )
 
-# print(tallo[ tallo.crown_radi.isna() ].shape)
+# """
+# Estimate the empirical bivariate distribution of trees' morphology in each site
+# with enough samples. The process involves the discretization of the height-crown
+# radius domain for a range of cell sizes. The resulting distribution is fitted
+# by GAM or Gaussian Process Regression and then the values predicted by the fitted
+# distribution are compared with the original samples. Based on the accuracy
+# obtained, a discretization of the height-crown radius domain is kept for each
+# site and the best regression is kept to estimate the AGB/ha in the site.
+# """
+#
+# for site in tallo.site_id.unique():
+#     tallo_site = tallo[tallo.site_id == site]
+#     # Extract tree height and crown radius data.
+#     X = tallo_site[["height_m","crown_radi"]]
+#     # Initialize de grid resolution, resolution step and minimum resolution.
+#     lmin  = 0.1
+#     dl = 0.1
+#     lmax = 10.0
+#     lvec = np.arange(lmin,lmax,dl)
+#     # Initialize minimums and maximums for the H-CR domain.
+#     hmin = 0.0
+#     hmax = 10.0
+#     crmin = 0.0
+#     crmax = 10.0
+#     # Start the iterations to progressively decrement grid resolution.
+#     for l in lvec:
+#         hvec  = np.arange(hmin,hmax,l)
+#         crvec = np.arange(crmin,crmax,l)
+#         # Initialize the distribution matrix
+#         distribution = []
+#         # Start the iterations to count sample occurrence in the discretized
+#         # domain.
+#         for h in hvec:
+#             for cr in crvec:
+#                 matchs = X.where( (X.height_m > h-l) & (X.height_m < h+l) &
+#                             (X.crown_radi > cr-l) & (X.crown_radi < cr+l),
+#                             1.0, 0.0)
+#                 z = X.height_m.sum(axis=1)
+#                 distribution.append([h,cr,z])
+#         print(distribution)
+#         distribution = np.array(distribution)
+#
+#         # Create a Gaussian Process Regressor to fit the the obtained empirical
+#         # distribution.
+#         fit =
+#         domain = # This is the domain to produce points by evaluating the regressor.
+#         f = # This is the evaluated function.
+#
+#         # Evaluate the fit function on the original data points: this is done by
+#         # integrating the fitted function over multiple random domains and
+#         # comparing the result with the real number of occurrences in such domain.
 
+"""
+Estimate the empirical bivariate distribution of trees' morphology in each site
+with enough samples. The process involves a kernel-density estimation of the
+height-crown radius distribution. The outcome od the process is a dictionary
+from site_id to best parameters for the KDE.
+"""
+
+site_param_dict = {}
+for site in tallo.site_id.unique():
+    tallo_site = tallo[tallo.site_id == site]
+    # Extract tree height and crown radius data.
+    X = tallo_site[["height_m","crown_radi"]].to_numpy()
+    # Initialize the bandwidth vector to test.
+    bw_min = 0.3
+    bw_max = 2.0
+    bw_d   = 0.1
+    bw_vec = np.arange(bw_min,bw_max,bw_d)
+    # Initialize the maximum log_likelihood
+    ll_max = -999999.0
+    # Start iterations for testing KDE parametrizations: better use GridSearchCV
+    for bw in bw_vec:
+        # Build the KDE instance.
+        kde = KernelDensity(kernel = 'gaussian', bandwidth = bw).fit(X)
+        log_likelihood = kde.score_samples(X)
+        if log_likelihood > ll_max :
+            ll_max = log_likelihood
+            params = (k,bw)
+    site_param_dict[site] = params
+
+"""
+Join tree density data and calculate average tree density in every site to start
+generating forests based on the estimated distributions of height and crown
+radius. This requires simulating the N trees and calculating total biomass M
+times to then average. The std of the observation can be kept as information on
+the possible spread.
+"""
+
+# Add tree density information to the dataset.
+
+tree_density = "./tree_density_data/tree_density_data/tree_density_biome_based_model_crowther_nature_2015_4326_float32.tiff"
+
+# Extract the coordinates list from the Tallo point layer.
+coord_list = [(x,y) for x,y in zip(tallo['geometry'].x , tallo['geometry'].y)]
+
+raster = rasterio.open(tree_density)
+tallo["tree_dens"] = [x for x in raster.sample(coord_list)]
+
+df = pd.DataFrame(tallo)
+df = df.explode( "tree_dens" )
+tallo = gpd.GeoDataFrame(df).reset_index(drop=True)
+tallo = tallo.astype( {"tree_dens":"float"} )
+print(tallo)
+# tallo.to_file("./temp_data/tallo_bioclim.shp", driver = "ESRI Shapefile")
+
+# Simulate tree morphologies' occurrences based on the KDEs and calculate
+# average AGB/ha in each site.
+agb_dict = {}
+for site in tallo.site_id.unique():
+    tallo_site = tallo[tallo.site_id == site]
+    # Extract tree height and crown radius data.
+    X = tallo_site[["height_m","crown_radi"]].to_numpy()
+    # Calculate the average number of samples needed to simulate AGB in site.
+    n_samples = tallo_site.tree_dens.mean()
+    # Esimate the distribution with the optimum parameters.
+    kde = KernelDensity( kernel = 'gaussian',
+                         bandwidth = site_param_dict[site] ).fit(X)
+    # Initialize AGB list.
+    agb_list = []
+    replication = 100
+    for i in range(replication):
+        # Initialize AGB
+        agb = 0
+        # Generate the tree instances
+        trees = kde.sample(n_samples)
+        for tree in trees:
+            h = tree[0]
+            cr = tree[1]
+            agb += (above_ground_biomass(h,cr)
+        agb_list.append(agb)
+    median_agb = np.median(np.array(agb))
+    agb_dict[site] = median_agb
+
+"""
+Dissolve the data per site and add the AGB
+"""
+
+
+
+
+
+
+
+
+
+# print(tallo[ tallo.crown_radi.isna() ].shape)
+#
+# """
+# Test for bivariate log-normality in each site
+# """
+#
+# print("Testing joint log-normality with HZ test in the grouped dataset.")
+# positive = 0
+# negative = 0
+# for site in tallo.site_id.unique():
+#     # print("Site : " + str(site))
+#     tallo_site = tallo[tallo.site_id == site]
+#     # Extract the data to test: tree height and crown radius
+#     X = tallo_site[["height_m","crown_radi"]].to_numpy()
+#     if X.shape[0] >= 20:
+#         X = np.log(X)
+#         # print("Number of samples: " + str(X.shape[0]) + ", biome: " + str(tallo_site.head(1).biome))
+#         test_result = pg.multivariate_normality(X,alpha=.001)
+#         if test_result[2] == True:
+#             positive += 1
+#         else:
+#             negative += 1
+#     # print(test_result)
+# print(positive)
+# print(negative)
+# print(positive/negative)
+#
 # """
 # Test for bivariate normality in each site
 # """
@@ -570,9 +763,9 @@ tallo["crown_radi"] = np.where(
 #     tallo_site = tallo[tallo.site_id == site]
 #     # Extract the data to test: tree height and crown radius
 #     X = tallo_site[["height_m","crown_radi"]].to_numpy()
-#     if X.shape[0] >= 50:
+#     if X.shape[0] >= 20:
 #         # print("Number of samples: " + str(X.shape[0]) + ", biome: " + str(tallo_site.head(1).biome))
-#         test_result = pg.multivariate_normality(X,alpha=.05)
+#         test_result = pg.multivariate_normality(X,alpha=.001)
 #         if test_result[2] == True:
 #             positive += 1
 #         else:
@@ -581,8 +774,8 @@ tallo["crown_radi"] = np.where(
 # print(positive)
 # print(negative)
 # print(positive/negative)
-#
-#
+
+
 # print("Testing joint normality with HZ test in the initial dataset.")
 # tallo_init = gpd.read_file("./temp_data_grouping_buffer/tallo_sampling_site_r1000.shp")
 #
@@ -605,11 +798,11 @@ tallo["crown_radi"] = np.where(
 # print(negative)
 # print(positive/negative)
 
-#
-# """
-# Test for univariate normality of tree height and crown radius independently
-# """
-#
+
+"""
+Test for univariate normality of tree height and crown radius independently
+"""
+
 # print("Testing normality of tree height: d'agostino")
 # positive = 0
 # negative = 0
@@ -618,9 +811,10 @@ tallo["crown_radi"] = np.where(
 #     tallo_site = tallo[tallo.site_id == site]
 #     # Extract the data to test: tree height and crown radius
 #     X = tallo_site["height_m"].to_numpy()
-#     if X.shape[0] >= 10:
+#     if X.shape[0] >= 20:
+#         X = np.log(X)
 #         # print("Number of samples: " + str(X.shape[0]) + ", biome: " + str(tallo_site.head(1).biome))
-#         k2,p = scipy.stats.shapiro(X)
+#         k2,p = scipy.stats.normaltest(X)
 #         if p >= 0.05 == True:
 #             positive += 1
 #         else:
@@ -635,9 +829,10 @@ tallo["crown_radi"] = np.where(
 #     tallo_site = tallo[tallo.site_id == site]
 #     # Extract the data to test: tree height and crown radius
 #     X = tallo_site["crown_radi"].to_numpy()
-#     if X.shape[0] >= 10:
+#     if X.shape[0] >= 20:
+#         X = np.log(X)
 #         # print("Number of samples: " + str(X.shape[0]) + ", biome: " + str(tallo_site.head(1).biome))
-#         k2,p = scipy.stats.shapiro(X)
+#         k2,p = scipy.stats.normaltest(X)
 #         if p >= 0.05 == True:
 #             positive += 1
 #         else:
@@ -684,35 +879,35 @@ tallo["crown_radi"] = np.where(
 # print(positive)
 # print(negative)
 
-"""
-Merge the data: calculate mean, sd and convariance of height and crown radius.
-"""
-print(tallo.columns)
-
-# First calculate the mean and sd.
-
-tallo_forest = tallo.dissolve(
-    by = "site_id",
-    aggfunc = {
-        "stem_diame": ["mean",np.std],
-        "height_m": ["mean",np.std],
-        "crown_radi": ["mean",np.std],
-        "year_temp": ["mean",np.std],
-        "dryq_temp": ["mean",np.std],
-        "wetq_temp": ["mean",np.std],
-        "coldq_temp": ["mean",np.std],
-        "year_prec": ["mean",np.std],
-        "wetm_prec": ["mean",np.std],
-        "pet": ["mean",np.std],
-        "ai": ["mean",np.std],
-        "cont_id": "first",
-        "continent": "first",
-        "biome_id": "first",
-        "biome": "first",
-        "tree_id" : "first",
-        "n_samples" : "first"
-    }
-)
+# """
+# Merge the data: calculate mean, sd and convariance of height and crown radius.
+# """
+# print(tallo.columns)
+#
+# # First calculate the mean and sd.
+#
+# tallo_forest = tallo.dissolve(
+#     by = "site_id",
+#     aggfunc = {
+#         "stem_diame": ["mean",np.std],
+#         "height_m": ["mean",np.std],
+#         "crown_radi": ["mean",np.std],
+#         "year_temp": ["mean",np.std],
+#         "dryq_temp": ["mean",np.std],
+#         "wetq_temp": ["mean",np.std],
+#         "coldq_temp": ["mean",np.std],
+#         "year_prec": ["mean",np.std],
+#         "wetm_prec": ["mean",np.std],
+#         "pet": ["mean",np.std],
+#         "ai": ["mean",np.std],
+#         "cont_id": "first",
+#         "continent": "first",
+#         "biome_id": "first",
+#         "biome": "first",
+#         "tree_id" : "first",
+#         "n_samples" : "first"
+#     }
+# )
 
 # Now calculate the covariance between H and CR and merge with tallo_forest
 
