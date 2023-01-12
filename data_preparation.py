@@ -1287,7 +1287,10 @@ Let's start by 4 features to keep it simple and fast:
 - Potential Evapotranspiration logarithmized.
 - Tree density logarithmized.
 - Biogeographic Realm removing oceania and binary encoded.
-I first need the raster at the same resolution for every predictor and rasterize BGR
+I first need the raster at the same resolution for every predictor and rasterize BGR.
+Then I should proceed masking by regions and progressively build the predictions to avoid waiting too long
+for results. 
+Then I should find a way to 
 """
 
 

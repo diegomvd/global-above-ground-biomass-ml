@@ -7,7 +7,7 @@ The dataset must be a GeoDataFrame describing Point geometries.
 Raster and/or vector data is loaded in GeoDataFrames before addition.
 
 Created on Monday January 02 2023.
-@author: Diego Bengochea.
+@author: Diego Bengochea Paz.
 """
 
 import geopandas as gpd
